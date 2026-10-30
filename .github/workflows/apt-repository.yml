@@ -1,0 +1,107 @@
+name: Build and publish APT repository
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/*.deb'
+      - '.github/workflows/apt-repository.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install APT and GPG tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils gnupg gzip
+
+      - name: Import repository signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$APT_GPG_PRIVATE_KEY" || { echo '::error::Set APT_GPG_PRIVATE_KEY in repository Actions secrets'; exit 1; }
+          mkdir -m 700 "$RUNNER_TEMP/gnupg"
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "sec" { print $5; exit }' > "$RUNNER_TEMP/signing-key-id"
+          test -s "$RUNNER_TEMP/signing-key-id" || { echo '::error::No secret signing key was imported'; exit 1; }
+
+      - name: Build and sign repository metadata
+        env:
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          KEY_ID="$(cat "$RUNNER_TEMP/signing-key-id")"
+          mkdir -p public/pool/main/t/termux-wol public/dists/stable/main/binary-all
+          shopt -s nullglob
+          debs=(packages/*.deb)
+          (("${#debs[@]}" > 0)) || { echo '::error::No packages/*.deb files found'; exit 1; }
+          for deb in "${debs[@]}"; do
+            pkg_name="$(dpkg-deb -f "$deb" Package)"
+            arch="$(dpkg-deb -f "$deb" Architecture)"
+            [[ "$pkg_name" == termux-wol ]] || { echo "Unexpected package name: $pkg_name"; exit 1; }
+            [[ "$arch" == all ]] || { echo "Expected Architecture: all, got $arch"; exit 1; }
+            install -m 0644 "$deb" "public/pool/main/t/termux-wol/$(basename "$deb")"
+          done
+
+          (cd public && apt-ftparchive packages pool/main > dists/stable/main/binary-all/Packages)
+          gzip -n -9 -c public/dists/stable/main/binary-all/Packages > public/dists/stable/main/binary-all/Packages.gz
+          (cd public/dists/stable && apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin='TLester23' \
+            -o APT::FTPArchive::Release::Label='TLester23 Termux WoL' \
+            -o APT::FTPArchive::Release::Suite='stable' \
+            -o APT::FTPArchive::Release::Codename='stable' \
+            -o APT::FTPArchive::Release::Architectures='all' \
+            -o APT::FTPArchive::Release::Components='main' \
+            release . > Release.tmp)
+          {
+            printf '%s\n' 'Origin: TLester23' 'Label: TLester23 Termux WoL' 'Suite: stable' 'Codename: stable' 'Architectures: all' 'Components: main'
+            cat public/dists/stable/Release.tmp
+          } > public/dists/stable/Release
+          rm public/dists/stable/Release.tmp
+
+          test -n "$APT_GPG_PASSPHRASE" || { echo '::error::Set APT_GPG_PASSPHRASE in repository Actions secrets'; exit 1; }
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$APT_GPG_PASSPHRASE" \
+            --local-user "$KEY_ID" --clearsign \
+            --output public/dists/stable/InRelease public/dists/stable/Release
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$APT_GPG_PASSPHRASE" \
+            --local-user "$KEY_ID" --armor --detach-sign \
+            --output public/dists/stable/Release.gpg public/dists/stable/Release
+          gpg --batch --export "$KEY_ID" > public/termux-wol-archive-keyring.gpg
+          cat > public/index.html <<'HTML'
+          <!doctype html><html lang="en"><meta charset="utf-8"><title>Termux WoL APT</title><h1>Termux WoL APT repository</h1><p>Signed APT repository maintained by TLester23.</p></html>
+          HTML
+          touch public/.nojekyll
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
